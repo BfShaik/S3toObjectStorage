@@ -234,6 +234,250 @@ class OCIUploadRouter:
         }
 
     # -------------------------------------------------------------------------
+    # update_lifecycle — change retention days for a specific object in-place
+    # -------------------------------------------------------------------------
+    def update_lifecycle(
+        self,
+        bucket           : str,
+        object_key       : str,
+        new_delete_days  : int,
+        new_archive_days : Optional[int] = None,
+    ) -> None:
+        """
+        Override lifecycle rules for a specific object without moving it.
+
+        OCI lifecycle policies are bucket-level, not object-level. This
+        method adds prefix-exact rules to the bucket policy that target
+        only the given object key. Uses GET → merge → PUT to preserve all
+        existing Terraform-managed and migration rules.
+
+        Idempotent: calling it twice with the same key replaces the
+        previous override, not duplicates it.
+
+        Args:
+            bucket           : OCI bucket name (from upload() return value)
+            object_key       : Full object key including prefix
+            new_delete_days  : Days after upload before deletion
+            new_archive_days : Days after upload before archival (optional;
+                               omit to leave the bucket-level archive rule
+                               unchanged for this object)
+
+        Raises:
+            oci.exceptions.ServiceError : OCI API error
+
+        Note:
+            OCI buckets support ~1000 lifecycle rules. If you need to
+            override lifecycle for many individual objects, use
+            reclassify() to move them to a prefix that already has the
+            right policy — it scales without limit.
+
+        Example:
+            result = router.upload("report.pdf", body, "temp-raw")
+            # Legal hold — extend delete window to 10 years
+            router.update_lifecycle(
+                bucket          = result["bucket"],
+                object_key      = result["key"],
+                new_delete_days = 3650,
+            )
+        """
+        safe_name   = object_key.replace("/", "-").replace(".", "-")
+        del_rule    = f"override-{safe_name}-delete"
+        arch_rule   = f"override-{safe_name}-archive"
+        stale_names = {del_rule, arch_rule}
+
+        # GET existing policy — preserve all other rules
+        try:
+            existing       = self._client.get_object_lifecycle_policy(self._namespace, bucket)
+            existing_rules = list(existing.data.items or [])
+        except oci.exceptions.ServiceError as e:
+            if e.status == 404:
+                existing_rules = []
+            else:
+                logger.error(
+                    "Failed to GET lifecycle policy for %s: http=%s | %s",
+                    bucket, e.status, e.message
+                )
+                raise
+
+        # Remove stale override rules for this object (idempotent re-run)
+        merged_rules = [r for r in existing_rules if r.name not in stale_names]
+
+        # Add archive override if requested
+        if new_archive_days is not None:
+            merged_rules.append(
+                oci.object_storage.models.ObjectLifecycleRule(
+                    name       = arch_rule,
+                    action     = "ARCHIVE",
+                    time_amount = new_archive_days,
+                    time_unit  = "DAYS",
+                    is_enabled = True,
+                    object_name_filter = oci.object_storage.models.ObjectNameFilter(
+                        inclusion_prefixes=[object_key]
+                    ),
+                )
+            )
+
+        # Add delete override
+        merged_rules.append(
+            oci.object_storage.models.ObjectLifecycleRule(
+                name       = del_rule,
+                action     = "DELETE",
+                time_amount = new_delete_days,
+                time_unit  = "DAYS",
+                is_enabled = True,
+                object_name_filter = oci.object_storage.models.ObjectNameFilter(
+                    inclusion_prefixes=[object_key]
+                ),
+            )
+        )
+
+        # PUT merged policy — Terraform-managed rules untouched
+        self._client.put_object_lifecycle_policy(
+            self._namespace,
+            bucket,
+            oci.object_storage.models.PutObjectLifecyclePolicyDetails(items=merged_rules),
+        )
+
+        logger.info(
+            "Lifecycle overridden | bucket=%s | key=%s | delete=%dd | archive=%s",
+            bucket, object_key, new_delete_days,
+            f"{new_archive_days}d" if new_archive_days is not None else "unchanged",
+        )
+
+    # -------------------------------------------------------------------------
+    # reclassify — move object to a different classification's bucket/prefix
+    # -------------------------------------------------------------------------
+    def reclassify(
+        self,
+        object_key         : str,
+        current_bucket     : str,
+        new_classification : str,
+        extra_meta         : Optional[dict] = None,
+    ) -> dict:
+        """
+        Move an object to a new classification's bucket and prefix.
+
+        Downloads the object from its current location, re-uploads to the
+        bucket/prefix defined for new_classification (preserving all
+        existing metadata and the original creation date), then deletes
+        the original. The original is only deleted after a successful
+        upload — no data loss on partial failure.
+
+        Use this when the object's data class has genuinely changed
+        (e.g. temp-raw promoted to compliance-sox after legal review),
+        or when you need per-object lifecycle changes at scale (avoids
+        the ~1000 rule bucket policy limit that update_lifecycle has).
+
+        Args:
+            object_key         : Full current key including prefix
+            current_bucket     : Current OCI bucket name
+            new_classification : Target classification from classifications.json
+            extra_meta         : Extra metadata to attach on re-upload (optional)
+
+        Returns:
+            Same shape as upload(): { bucket, key, namespace, classification }
+
+        Raises:
+            ValueError                  : Unknown new_classification
+            oci.exceptions.ServiceError : OCI API error
+
+        Example:
+            result = router.upload("contract.pdf", body, "temp-raw")
+            # After legal review — promote to long-term compliance bucket
+            new = router.reclassify(
+                object_key         = result["key"],
+                current_bucket     = result["bucket"],
+                new_classification = "compliance-sox",
+            )
+            # Object now lives in bucket-compliance-prod/sox/contract.pdf
+            # with 7-year delete policy applied automatically
+        """
+        if new_classification not in self._valid_keys:
+            raise ValueError(
+                f"Unknown classification '{new_classification}'.\n"
+                f"Valid values: {sorted(self._valid_keys)}"
+            )
+
+        # ── Step 1: Download object + read existing metadata ─────────────────
+        try:
+            response = self._client.get_object(self._namespace, current_bucket, object_key)
+            body     = response.data.content
+            head     = self._client.head_object(self._namespace, current_bucket, object_key)
+            old_meta = {
+                k.replace("opc-meta-", ""): v
+                for k, v in head.headers.items()
+                if k.lower().startswith("opc-meta-")
+            }
+        except oci.exceptions.ServiceError as e:
+            logger.error(
+                "Failed to read source object %s/%s: http=%s | %s",
+                current_bucket, object_key, e.status, e.message
+            )
+            raise
+
+        # ── Step 2: Build relative key — strip old classification prefix ──────
+        old_classification = old_meta.get("classification", "")
+        if old_classification in self._routing_map:
+            _, old_prefix = self._routing_map[old_classification]
+            # Strip old prefix to get the relative sub-path
+            relative_key = (
+                object_key[len(old_prefix):]
+                if object_key.startswith(old_prefix)
+                else object_key.split("/")[-1]
+            )
+        else:
+            # Unknown old classification — use leaf filename only
+            relative_key = object_key.split("/")[-1]
+
+        # ── Step 3: Merge metadata — preserve creation date, update class ─────
+        merged_meta = {**old_meta}
+        merged_meta["classification"]       = new_classification
+        merged_meta["reclassified-from"]    = old_classification or "unknown"
+        merged_meta["reclassification-date"] = (
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        if extra_meta:
+            merged_meta.update(extra_meta)
+
+        # Recover original creation date for upload() so it is preserved
+        original_date = None
+        raw_date = old_meta.get("original-creation-date")
+        if raw_date:
+            try:
+                original_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+        # ── Step 4: Upload to new classification ──────────────────────────────
+        result = self.upload(
+            object_name    = relative_key,
+            body           = body,
+            classification = new_classification,
+            extra_meta     = merged_meta,
+            original_date  = original_date,
+        )
+
+        # ── Step 5: Delete original — only after successful upload ────────────
+        try:
+            self._client.delete_object(self._namespace, current_bucket, object_key)
+        except oci.exceptions.ServiceError as e:
+            logger.error(
+                "Upload succeeded but delete of original failed %s/%s: http=%s | %s — "
+                "object exists in both locations, manual cleanup needed.",
+                current_bucket, object_key, e.status, e.message
+            )
+            raise
+
+        new_bucket, _ = self._routing_map[new_classification]
+        logger.info(
+            "Reclassified | %s/%s → %s/%s | %s → %s",
+            current_bucket, object_key,
+            new_bucket, result["key"],
+            old_classification or "?", new_classification,
+        )
+        return result
+
+    # -------------------------------------------------------------------------
     # valid_classifications — useful for validation in calling code
     # -------------------------------------------------------------------------
     @property
