@@ -1,0 +1,152 @@
+{
+  "_comment": [
+    "=============================================================",
+    "classifications.json — THE ONLY FILE THAT EVER CHANGES",
+    "=============================================================",
+    "WHAT THIS FILE DOES:",
+    "  This is the single source of truth for every bucket, prefix,",
+    "  and retention rule in the entire OCI lifecycle system.",
+    "  Both Terraform (infrastructure) and the Python upload router",
+    "  (application) read directly from this file.",
+    "  There is no other place where routing or retention rules live.",
+    "",
+    "READ BY:",
+    "  - terraform/main.tf          at deploy time (jsondecode + file())",
+    "  - router/oci_upload_router.py at runtime    (json.load)",
+    "",
+    "OWNED BY:   Cloud ops / Data governance team",
+    "CHANGED BY: Cloud ops admin only",
+    "",
+    "HOW TO ADD A NEW CLASSIFICATION:",
+    "  1. Add one JSON block below following the existing pattern",
+    "  2. Run: terraform apply",
+    "  3. Done — Python router picks it up automatically on next start",
+    "     No code changes. No developer needed.",
+    "",
+    "FIELD REFERENCE:",
+    "  bucket        : OCI bucket name the object routes to",
+    "  prefix        : Folder path within the bucket  (must end with /)",
+    "  archive_days  : Days after upload to move to Archive tier",
+    "                  null = skip archive, go straight to delete",
+    "  delete_days   : Days after upload to permanently delete",
+    "=============================================================",
+    "NOTE: JSON does not support comments natively.",
+    "This _comment array is intentionally ignored by all consumers."
+  ],
+
+  "classifications": {
+
+    "pii-customers": {
+      "bucket"      : "bucket-pii-prod",
+      "prefix"      : "customers/",
+      "archive_days": 90,
+      "delete_days" : 2555,
+      "_note"       : "Customer PII — GDPR/CCPA — archive 90d, delete 7yr"
+    },
+
+    "pii-employees": {
+      "bucket"      : "bucket-pii-prod",
+      "prefix"      : "employees/",
+      "archive_days": 90,
+      "delete_days" : 3650,
+      "_note"       : "HR / employee records — archive 90d, delete 10yr"
+    },
+
+    "pii-financial": {
+      "bucket"      : "bucket-pii-prod",
+      "prefix"      : "financial/",
+      "archive_days": 30,
+      "delete_days" : 3650,
+      "_note"       : "Financial PII — archive 30d, delete 10yr"
+    },
+
+    "pii-health": {
+      "bucket"      : "bucket-pii-prod",
+      "prefix"      : "health/",
+      "archive_days": 30,
+      "delete_days" : 5475,
+      "_note"       : "Health data — HIPAA — archive 30d, delete 15yr"
+    },
+
+    "compliance-sox": {
+      "bucket"      : "bucket-compliance-prod",
+      "prefix"      : "sox/",
+      "archive_days": 30,
+      "delete_days" : 2555,
+      "_note"       : "SOX compliance records — archive 30d, delete 7yr"
+    },
+
+    "compliance-gdpr": {
+      "bucket"      : "bucket-compliance-prod",
+      "prefix"      : "gdpr/",
+      "archive_days": 30,
+      "delete_days" : 3650,
+      "_note"       : "GDPR compliance records — archive 30d, delete 10yr"
+    },
+
+    "compliance-contracts": {
+      "bucket"      : "bucket-compliance-prod",
+      "prefix"      : "contracts/",
+      "archive_days": 30,
+      "delete_days" : 3650,
+      "_note"       : "Legal contracts — archive 30d, delete 10yr"
+    },
+
+    "compliance-audit": {
+      "bucket"      : "bucket-compliance-prod",
+      "prefix"      : "audit-trails/",
+      "archive_days": 7,
+      "delete_days" : 3650,
+      "_note"       : "Audit trails — archive 7d, delete 10yr"
+    },
+
+    "temp-raw": {
+      "bucket"      : "bucket-temp-processing",
+      "prefix"      : "raw-ingestion/",
+      "archive_days": null,
+      "delete_days" : 1,
+      "_note"       : "Raw ingestion — no archive, delete after 1 day"
+    },
+
+    "temp-processing": {
+      "bucket"      : "bucket-temp-processing",
+      "prefix"      : "processing/",
+      "archive_days": null,
+      "delete_days" : 3,
+      "_note"       : "In-flight processing — no archive, delete after 3 days"
+    },
+
+    "temp-staging": {
+      "bucket"      : "bucket-temp-processing",
+      "prefix"      : "staging/",
+      "archive_days": null,
+      "delete_days" : 7,
+      "_note"       : "Pre-validation staging — no archive, delete after 7 days"
+    },
+
+    "log-application": {
+      "bucket"      : "bucket-logs-prod",
+      "prefix"      : "application/",
+      "archive_days": 30,
+      "delete_days" : 90,
+      "_note"       : "Application logs — archive 30d, delete 90d"
+    },
+
+    "log-access": {
+      "bucket"      : "bucket-logs-prod",
+      "prefix"      : "access/",
+      "archive_days": 7,
+      "delete_days" : 30,
+      "_note"       : "Access logs — archive 7d, delete 30d"
+    },
+
+    "log-security": {
+      "bucket"      : "bucket-logs-prod",
+      "prefix"      : "security/",
+      "archive_days": 7,
+      "delete_days" : 365,
+      "_note"       : "Security logs — archive 7d, delete 365d"
+    }
+
+  }
+}

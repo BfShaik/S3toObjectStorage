@@ -3,93 +3,69 @@
 # =============================================================================
 #
 # WHAT THIS FILE DOES:
-#   This script runs exactly once during the migration cutover window
-#   and is discarded afterwards. It copies all existing objects from
-#   AWS S3 to OCI Object Storage in three sequential phases:
+#   One-time script that migrates all objects from AWS S3 to OCI Object
+#   Storage. Runs once during the cutover window and is discarded after.
+#   Reads routing rules from config/classifications.json — the same file
+#   Terraform and the upload router use. No routing logic is hardcoded here.
 #
 #   PHASE 1 — Extract S3 inventory
-#     Scans every object in the source S3 bucket and writes its key,
+#     Scans every object in the S3 source bucket and writes its key,
 #     original LastModified date, S3 tags, size, and storage class
-#     to a local CSV inventory file. This is the source of truth for
-#     the entire migration. Review the CSV before running Phase 2.
+#     to a local CSV. Review this CSV before running Phase 2.
 #
 #   PHASE 2 — Copy objects S3 → OCI
-#     Reads the inventory CSV. For each object: downloads from S3,
-#     translates all S3 tags to OCI opc-meta-* metadata, preserves
-#     the original S3 creation date in opc-meta-original-creation-date
-#     (CRITICAL — without this OCI would give every object a fresh
-#     retention window from today), and uploads to OCI under a
-#     year-cohort prefix so lifecycle rules apply correct remaining
-#     retention. Script is resumable — re-running skips existing objects.
+#     For each object: downloads from S3, translates S3 tags to
+#     opc-meta-* metadata, preserves the original S3 creation date
+#     (CRITICAL — without this every object gets a fresh retention
+#     window from today, violating compliance), and uploads to OCI
+#     under a year-cohort prefix. Script is fully resumable.
 #
-#   PHASE 3 — Apply reduced lifecycle rules for migration cohorts
-#     A 4-year-old object must NOT get a fresh 7-year delete window.
-#     This phase calculates the remaining retention days for each
-#     year-cohort prefix and applies a reduced DELETE lifecycle rule
-#     via the OCI SDK (GET existing policy → merge → PUT). Objects
-#     already past their deadline are flagged OVERDUE and must be
-#     deleted immediately.
+#   PHASE 3 — Apply reduced lifecycle rules for cohort prefixes
+#     A 4-year-old object must not get a fresh 7-year delete window.
+#     Calculates remaining retention per year-cohort and applies
+#     reduced DELETE rules via OCI SDK (GET → merge → PUT atomically).
+#     Objects already past their deadline are flagged OVERDUE.
 #
 # OWNED BY:   Migration team
-# RUNS:       Once during cutover window — then discarded
-# RESUMABLE:  Yes — set SKIP_EXISTING = True (default) to safely re-run
+# RUNS:       Once during cutover window — delete after validation
+# RESUMABLE:  Yes — re-running skips objects already present in OCI
 # DEPENDS ON: boto3 (pip install boto3)
 #             oci   (pip install oci)
-#             router/router_config.py (auto-resolved via sys.path)
+#             config/classifications.json  (shared with Terraform + router)
 # =============================================================================
 
 import csv
 import json
 import logging
 import os
-import sys
 from datetime import datetime, timezone
-
-# router_config.py lives in ../router/ — add it to the path so this script
-# can be run from the project root: python migration/migration_script.py
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "router"))
 
 import boto3
 import oci
-import oci.object_storage
 import oci.exceptions
-
-from router_config import ROUTING_MAP
+import oci.object_storage
 
 # =============================================================================
 # CONFIGURATION — edit these values before running
 # =============================================================================
 
-S3_SOURCE_BUCKET = "your-source-s3-bucket"     # AWS S3 bucket to migrate from
-S3_REGION        = "us-east-1"                  # AWS region of the source bucket
-OCI_CONFIG_PATH  = "~/.oci/config"              # OCI SDK config file path
-INVENTORY_FILE   = "s3_inventory.csv"           # CSV written by Phase 1
-LOG_FILE         = "migration.log"              # Migration run log
+S3_SOURCE_BUCKET = "your-source-s3-bucket"   # AWS S3 bucket to migrate from
+S3_REGION        = "us-east-1"               # AWS region of source bucket
+OCI_CONFIG_PATH  = "~/.oci/config"           # OCI SDK config file path
+INVENTORY_FILE   = "s3_inventory.csv"        # CSV written by Phase 1
+LOG_FILE         = "migration.log"           # Full run log
 
-SKIP_EXISTING    = True   # Skip objects already in OCI — safe for re-runs
-DRY_RUN          = True   # ALWAYS start with True — set False only after reviewing migration.log
+SKIP_EXISTING    = True    # Skip objects already in OCI — safe for re-runs
+DRY_RUN          = True    # ALWAYS start True — set False only after reviewing migration.log
 
-# Full retention windows per classification (days)
-# These MUST match lifecycle_config.auto.tfvars exactly
-RETENTION_RULES = {
-    "pii-customers"       : {"archive_days": 90,   "delete_days": 2555},
-    "pii-employees"       : {"archive_days": 90,   "delete_days": 3650},
-    "pii-financial"       : {"archive_days": 30,   "delete_days": 3650},
-    "pii-health"          : {"archive_days": 30,   "delete_days": 5475},
-    "compliance-sox"      : {"archive_days": 30,   "delete_days": 2555},
-    "compliance-gdpr"     : {"archive_days": 30,   "delete_days": 3650},
-    "compliance-contracts": {"archive_days": 30,   "delete_days": 3650},
-    "compliance-audit"    : {"archive_days": 7,    "delete_days": 3650},
-    "temp-raw"            : {"archive_days": None, "delete_days": 1   },
-    "temp-processing"     : {"archive_days": None, "delete_days": 3   },
-    "temp-staging"        : {"archive_days": None, "delete_days": 7   },
-    "log-application"     : {"archive_days": 30,   "delete_days": 90  },
-    "log-access"          : {"archive_days": 7,    "delete_days": 30  },
-    "log-security"        : {"archive_days": 7,    "delete_days": 365 },
-}
+# Path to shared config — same file used by Terraform and the upload router
+_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "config", "classifications.json"
+)
 
 # =============================================================================
-# SETUP — logging
+# SETUP
 # =============================================================================
 
 logging.basicConfig(
@@ -103,9 +79,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# HELPERS
-# =============================================================================
+def _load_config() -> dict:
+    """
+    Load classifications.json — the single source of truth.
+    Returns the full classifications dict.
+    Raises immediately if the file is missing or malformed.
+    """
+    config_path = os.path.normpath(_CONFIG_PATH)
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"classifications.json not found at: {config_path}"
+        )
+    with open(config_path) as f:
+        data = json.load(f)
+    return {
+        k: v for k, v in data["classifications"].items()
+        if not k.startswith("_")
+    }
+
+
+def _build_routing_map(classifications: dict) -> dict:
+    """
+    Build routing map from classifications config.
+    Returns: { "pii-customers": ("bucket-pii-prod", "customers/"), ... }
+    Same logic as oci_upload_router.py — consistent by design.
+    """
+    return {
+        key: (val["bucket"], val["prefix"])
+        for key, val in classifications.items()
+    }
+
+
+def _build_retention_map(classifications: dict) -> dict:
+    """
+    Build retention map from classifications config.
+    Returns: { "pii-customers": { archive_days: 90, delete_days: 2555 }, ... }
+    Used in Phase 3 to calculate remaining retention per cohort.
+    """
+    return {
+        key: {
+            "archive_days": val.get("archive_days"),
+            "delete_days" : val["delete_days"],
+        }
+        for key, val in classifications.items()
+    }
+
 
 def _get_oci_client():
     config    = oci.config.from_file(OCI_CONFIG_PATH)
@@ -118,36 +136,31 @@ def _get_s3_client():
     return boto3.client("s3", region_name=S3_REGION)
 
 
-def _object_exists_in_oci(client, namespace, bucket, key):
-    """Return True if the object already exists in OCI (for resumable runs)."""
+def _object_exists_in_oci(client, namespace, bucket, key) -> bool:
+    """Return True if object already exists in OCI. Used for resumable runs."""
     try:
         client.head_object(namespace, bucket, key)
         return True
     except oci.exceptions.ServiceError as e:
         if e.status == 404:
             return False
-        raise  # propagate auth errors, 500s, etc. — don't silently swallow them
+        raise  # propagate auth errors, 500s — don't silently swallow them
 
 
 # =============================================================================
 # PHASE 1 — Extract S3 inventory
 # =============================================================================
 
-def phase1_extract_inventory():
+def phase1_extract_inventory() -> int:
     """
-    Scan the S3 source bucket and write every object's metadata to
-    INVENTORY_FILE. This CSV is the source of truth for Phase 2.
+    Scan S3 source bucket and write all object metadata to INVENTORY_FILE.
+    This CSV is the source of truth for Phase 2 — review it before proceeding.
 
-    Columns written:
-        key            : S3 object key
-        original_date  : S3 LastModified — the true creation date (PRESERVE)
-        size_bytes     : Object size in bytes
-        storage_class  : S3 storage class (STANDARD, GLACIER, etc.)
-        tags           : JSON string of all S3 tags → becomes opc-meta-* on OCI
+    Columns: key, original_date, size_bytes, storage_class, tags (JSON string)
     """
-    logger.info("=" * 60)
-    logger.info("PHASE 1: Extracting S3 inventory from bucket: %s", S3_SOURCE_BUCKET)
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("PHASE 1: Extracting S3 inventory from: %s", S3_SOURCE_BUCKET)
+    logger.info("=" * 65)
 
     s3        = _get_s3_client()
     paginator = s3.get_paginator("list_objects_v2")
@@ -161,7 +174,7 @@ def phase1_extract_inventory():
             size_bytes    = obj["Size"]
             storage_class = obj.get("StorageClass", "STANDARD")
 
-            # Read all S3 tags — each tag becomes one opc-meta-* key on OCI
+            # Read all S3 tags — each becomes one opc-meta-* key on OCI
             try:
                 tag_resp = s3.get_object_tagging(Bucket=S3_SOURCE_BUCKET, Key=key)
                 tags     = {t["Key"]: t["Value"] for t in tag_resp.get("TagSet", [])}
@@ -171,19 +184,17 @@ def phase1_extract_inventory():
 
             inventory.append({
                 "key"          : key,
-                "original_date": original_date,  # CRITICAL — preserve this
+                "original_date": original_date,  # CRITICAL — do not lose this
                 "size_bytes"   : size_bytes,
                 "storage_class": storage_class,
                 "tags"         : json.dumps(tags),
             })
-
             count += 1
             if count % 1000 == 0:
                 logger.info("  Progress: %d objects inventoried...", count)
 
-    # Write to CSV
     if not inventory:
-        logger.warning("No objects found in bucket %s", S3_SOURCE_BUCKET)
+        logger.warning("No objects found in bucket: %s", S3_SOURCE_BUCKET)
         return 0
 
     with open(INVENTORY_FILE, "w", newline="") as f:
@@ -191,8 +202,8 @@ def phase1_extract_inventory():
         writer.writeheader()
         writer.writerows(inventory)
 
-    logger.info("Phase 1 complete: %d objects written to %s", count, INVENTORY_FILE)
-    logger.info("ACTION REQUIRED: Review %s before running Phase 2", INVENTORY_FILE)
+    logger.info("Phase 1 complete: %d objects → %s", count, INVENTORY_FILE)
+    logger.info("ACTION: Review %s before running Phase 2", INVENTORY_FILE)
     return count
 
 
@@ -200,33 +211,30 @@ def phase1_extract_inventory():
 # PHASE 2 — Copy objects S3 → OCI
 # =============================================================================
 
-def phase2_copy_objects():
+def phase2_copy_objects(routing_map: dict) -> tuple[int, int]:
     """
-    Read the inventory CSV and copy each object from S3 to OCI.
+    Copy all objects from the S3 inventory to OCI.
 
     Year-cohort prefix strategy:
-        Objects land at: migration/{base_prefix}{year}/{original_key}
-        e.g.           : migration/customers/2022/reports/customer-001.json
+        Objects land at:  migration/{base_prefix}{year}/{original_key}
+        e.g.              migration/customers/2022/reports/file.json
+        This lets Phase 3 apply REDUCED delete rules per cohort so that
+        old objects do not get a fresh full-length retention window.
 
-        This allows Phase 3 to apply REDUCED delete rules per cohort.
-        A 4-year-old PII file needs only 3 more years (1095 days),
-        not a fresh 7-year window from today.
-
-    Metadata translation:
-        Every S3 tag key-value pair becomes an opc-meta-* key on OCI.
-        opc-meta-original-creation-date is always set from the S3
-        LastModified date — NOT from today's date.
+    Metadata strategy:
+        All S3 tags → opc-meta-* keys (1:1 translation)
+        opc-meta-original-creation-date always = S3 LastModified date
+        This is the most critical field — it preserves true object age.
     """
-    logger.info("=" * 60)
+    logger.info("=" * 65)
     logger.info("PHASE 2: Copying objects S3 → OCI")
-    logger.info("=" * 60)
+    logger.info("DRY_RUN=%s | SKIP_EXISTING=%s", DRY_RUN, SKIP_EXISTING)
+    logger.info("=" * 65)
 
     client, namespace = _get_oci_client()
     s3                = _get_s3_client()
-    copied            = 0
-    skipped           = 0
-    errors            = 0
     today             = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    copied = skipped = errors = 0
 
     with open(INVENTORY_FILE, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -236,61 +244,52 @@ def phase2_copy_objects():
 
     for i, row in enumerate(rows, 1):
         key            = row["key"]
-        original_date  = row["original_date"]
+        original_date  = row["original_date"]        # S3 LastModified — preserve
         tags           = json.loads(row["tags"])
         classification = tags.get("classification", "")
 
-        # Validate classification — skip unknown ones with a warning
-        if classification not in ROUTING_MAP:
+        # Validate classification exists in config
+        if classification not in routing_map:
             logger.warning(
-                "[%d/%d] Unknown classification '%s' for object %s — skipping",
+                "[%d/%d] Unknown classification '%s' for %s — skipping",
                 i, total, classification, key
             )
             errors += 1
             continue
 
-        bucket, base_prefix = ROUTING_MAP[classification]
+        bucket, base_prefix = routing_map[classification]
 
-        # Build year-cohort migration key
-        # Encodes the original creation year into the path
-        # so lifecycle rules can apply the correct remaining retention
-        cohort_year   = original_date[:4]                              # e.g. "2022"
-        migration_key = f"migration/{base_prefix}{cohort_year}/{key}"  # e.g. migration/customers/2022/file.csv
+        # Year-cohort key — encodes original age into the object path
+        cohort_year   = original_date[:4]
+        migration_key = f"migration/{base_prefix}{cohort_year}/{key}"
 
-        # Skip if already exists in OCI (resumable run support)
+        # Skip if already in OCI (safe re-run support)
         if SKIP_EXISTING and _object_exists_in_oci(client, namespace, bucket, migration_key):
             skipped += 1
-            if skipped % 500 == 0:
-                logger.info("  Skipped %d already-migrated objects...", skipped)
             continue
 
         if DRY_RUN:
-            logger.info(
-                "[DRY RUN] [%d/%d] Would copy: %s → %s/%s",
-                i, total, key, bucket, migration_key
-            )
+            logger.info("[DRY RUN] [%d/%d] %s → %s/%s", i, total, key, bucket, migration_key)
             copied += 1
             continue
 
         # Download from S3
         try:
-            s3_obj = s3.get_object(Bucket=S3_SOURCE_BUCKET, Key=key)
-            body   = s3_obj["Body"].read()
+            body = s3.get_object(Bucket=S3_SOURCE_BUCKET, Key=key)["Body"].read()
         except Exception as e:
-            logger.error("[%d/%d] S3 download failed: %s | error: %s", i, total, key, e)
+            logger.error("[%d/%d] S3 download failed: %s | %s", i, total, key, e)
             errors += 1
             continue
 
-        # Build OCI metadata
-        # Translate all S3 tags → opc-meta-* keys (1:1 mapping)
+        # Build OCI metadata — translate all S3 tags + add migration fields
         metadata = {k: v for k, v in tags.items()}
-        metadata["original-creation-date"] = original_date  # CRITICAL — do not use today
+        metadata["original-creation-date"] = original_date   # CRITICAL
         metadata["migrated-from"]          = "s3"
         metadata["migration-date"]         = today
         metadata["source-bucket"]          = S3_SOURCE_BUCKET
         metadata["source-storage-class"]   = row["storage_class"]
 
-        # Upload to OCI with all metadata in one atomic call
+        # Upload to OCI — object + metadata in one atomic call
         try:
             client.put_object(
                 namespace_name  = namespace,
@@ -302,16 +301,15 @@ def phase2_copy_objects():
             copied += 1
             if copied % 500 == 0:
                 logger.info("  Progress: %d/%d copied...", copied, total)
-
         except oci.exceptions.ServiceError as e:
             logger.error(
-                "[%d/%d] OCI upload failed: %s | status: %s | %s",
+                "[%d/%d] OCI upload failed: %s | http=%s | %s",
                 i, total, key, e.status, e.message
             )
             errors += 1
 
     logger.info(
-        "Phase 2 complete | copied=%d | skipped=%d (already existed) | errors=%d",
+        "Phase 2 complete | copied=%d | skipped=%d | errors=%d",
         copied, skipped, errors
     )
     return copied, errors
@@ -321,102 +319,88 @@ def phase2_copy_objects():
 # PHASE 3 — Apply reduced lifecycle rules for migration cohorts
 # =============================================================================
 
-def phase3_apply_cohort_lifecycle_rules(oci_namespace: str):  # noqa: C901
+def phase3_apply_cohort_lifecycle_rules(
+    routing_map   : dict,
+    retention_map : dict,
+    oci_namespace : str,
+) -> tuple[int, list]:
     """
-    Calculate remaining retention days for each migration year-cohort
-    and apply a reduced DELETE lifecycle rule to that cohort prefix.
+    Calculate remaining retention days per year-cohort and apply a reduced
+    DELETE lifecycle rule to each cohort prefix in OCI.
 
-    Why this is necessary:
-        OCI lifecycle measures object age from Last-Modified date.
+    Why this matters:
         All migrated objects have Last-Modified = today (migration date).
-        Without cohort rules, a 4-year-old PII file would get
-        a fresh 7-year (2555-day) delete window — a compliance violation.
-
-    What this phase does:
-        For each classification + year-cohort combination:
-            days_elapsed   = today - original_year (approximate)
-            remaining_days = full_delete_days - days_elapsed
-
-            If remaining_days <= 0:  FLAG as OVERDUE → delete immediately
-            If remaining_days > 0:   Apply DELETE rule with remaining_days
-                                     to prefix: migration/{base}/{year}/
+        OCI lifecycle counts retention from Last-Modified — so without
+        cohort rules, a 4-year-old PII file would get a fresh 7-year window.
+        That is a compliance violation.
 
     Example:
-        Classification : pii-customers  (full retention = 2555 days / 7 years)
-        Cohort year    : 2022
-        Days elapsed   : ~1520 days (approx 4.2 years)
-        Remaining      : 2555 - 1520 = 1035 days
-        Rule applied   : DELETE migration/customers/2022/ after 1035 days
+        Classification : pii-customers  (full retention = 2555 days)
+        Cohort year    : 2022  (approx 4 years ago)
+        Days elapsed   : ~1460
+        Remaining      : 2555 - 1460 = 1095 days
+        Rule applied   : DELETE migration/customers/2022/ after 1095 days
     """
-    logger.info("=" * 60)
-    logger.info("PHASE 3: Applying reduced lifecycle rules for migration cohorts")
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("PHASE 3: Applying reduced lifecycle rules for cohort prefixes")
+    logger.info("=" * 65)
 
-    client, _   = _get_oci_client()
     today       = datetime.now(timezone.utc).date()
     overdue     = []
     rules_added = 0
 
-    # Determine all unique classification + year combinations from the inventory
-    cohorts: dict[str, set] = {}  # classification → set of years
-
+    # Collect all unique classification + year combinations from inventory
+    cohorts: dict[str, set] = {}
     with open(INVENTORY_FILE, newline="") as f:
         for row in csv.DictReader(f):
             tags           = json.loads(row["tags"])
             classification = tags.get("classification", "")
             year           = row["original_date"][:4]
-
-            if classification in ROUTING_MAP:
+            if classification in routing_map:
                 cohorts.setdefault(classification, set()).add(year)
 
-    # For each cohort, calculate remaining days and apply lifecycle rule
     for classification, years in cohorts.items():
-        bucket, base_prefix = ROUTING_MAP[classification]
-        rules               = RETENTION_RULES.get(classification)
-
-        if not rules:
-            logger.warning("No retention rules defined for %s — skipping", classification)
+        bucket, base_prefix = routing_map[classification]
+        retention           = retention_map.get(classification)
+        if not retention:
+            logger.warning("No retention config for '%s' — skipping", classification)
             continue
 
         for year in sorted(years):
-            # Approximate days elapsed since original creation
-            # Using Jan 1 of cohort year as a conservative baseline
-            cohort_start  = datetime(int(year), 1, 1, tzinfo=timezone.utc).date()
+            # Days elapsed since start of cohort year (conservative baseline)
+            cohort_start  = datetime(int(year), 1, 1).date()
             days_elapsed  = (today - cohort_start).days
-            remaining_del = rules["delete_days"] - days_elapsed
-
+            remaining_del = retention["delete_days"] - days_elapsed
             cohort_prefix = f"migration/{base_prefix}{year}/"
 
             if remaining_del <= 0:
-                # Object is past its retention deadline — flag for immediate action
+                # Past retention deadline — flag for immediate deletion
                 logger.warning(
-                    "OVERDUE: %s | classification=%s | year=%s | "
-                    "exceeded retention by %d days",
-                    cohort_prefix, classification, year, abs(remaining_del)
+                    "OVERDUE | bucket=%s | prefix=%s | exceeded by %d days",
+                    bucket, cohort_prefix, abs(remaining_del)
                 )
                 overdue.append({
-                    "bucket"        : bucket,
-                    "prefix"        : cohort_prefix,
+                    "bucket"      : bucket,
+                    "prefix"      : cohort_prefix,
+                    "overdue_days": abs(remaining_del),
                     "classification": classification,
-                    "year"          : year,
-                    "overdue_days"  : abs(remaining_del),
+                    "year"        : year,
                 })
                 continue
 
-            # Build the reduced DELETE lifecycle rule for this cohort
-            rule_name = f"migrate-{classification}-{year}-delete"
-
             logger.info(
-                "Cohort rule: %s | bucket=%s | prefix=%s | delete_after=%d days",
-                rule_name, bucket, cohort_prefix, remaining_del
+                "Cohort rule | bucket=%s | prefix=%s | delete_after=%d days",
+                bucket, cohort_prefix, remaining_del
             )
 
             if not DRY_RUN:
-                # GET existing policy rules so we can merge — never replace the whole policy.
-                # Replacing without merging would wipe all Terraform-managed lifecycle rules.
+                rule_name = f"cohort-{classification}-{year}-delete"
+
+                # GET existing policy so we can merge — never replace the whole policy.
+                # Replacing without merging wipes all Terraform-managed lifecycle rules.
                 try:
-                    existing_policy = client.get_object_lifecycle_policy(oci_namespace, bucket)
-                    existing_rules  = existing_policy.data.items or []
+                    existing = client.get_object_lifecycle_policy(oci_namespace, bucket)
+                    existing_rules = existing.data.items or []
                 except oci.exceptions.ServiceError as e:
                     if e.status == 404:
                         existing_rules = []
@@ -424,7 +408,7 @@ def phase3_apply_cohort_lifecycle_rules(oci_namespace: str):  # noqa: C901
                         logger.error("Failed to GET lifecycle policy for %s: %s", bucket, e.message)
                         continue
 
-                # Remove any stale rule with the same name (idempotent re-run support)
+                # Remove stale rule with same name (idempotent re-run support)
                 merged_rules = [r for r in existing_rules if r.name != rule_name]
 
                 # Append the new cohort rule
@@ -441,7 +425,7 @@ def phase3_apply_cohort_lifecycle_rules(oci_namespace: str):  # noqa: C901
                     )
                 )
 
-                # PUT the merged policy atomically — Terraform rules are preserved
+                # PUT merged policy atomically — Terraform rules are preserved
                 try:
                     client.put_object_lifecycle_policy(
                         oci_namespace,
@@ -452,59 +436,67 @@ def phase3_apply_cohort_lifecycle_rules(oci_namespace: str):  # noqa: C901
                     )
                     rules_added += 1
                 except oci.exceptions.ServiceError as e:
-                    logger.error("Failed to apply rule %s: %s", rule_name, e.message)
+                    logger.error("Failed to apply cohort rule %s: %s", rule_name, e.message)
 
-    # Summary of OVERDUE objects
     if overdue:
-        logger.warning("=" * 60)
-        logger.warning("ACTION REQUIRED — %d OVERDUE cohorts found:", len(overdue))
+        logger.warning("=" * 65)
+        logger.warning("ACTION REQUIRED — %d OVERDUE cohorts:", len(overdue))
         for item in overdue:
             logger.warning(
-                "  DELETE IMMEDIATELY: bucket=%s prefix=%s (overdue by %d days)",
+                "  DELETE IMMEDIATELY: bucket=%s | prefix=%s | overdue by %d days",
                 item["bucket"], item["prefix"], item["overdue_days"]
             )
-        logger.warning("These objects exceeded their retention deadline.")
-        logger.warning("They must be deleted manually or via an emergency lifecycle rule.")
-        logger.warning("=" * 60)
-    else:
-        logger.info("No OVERDUE cohorts found.")
+        logger.warning("These objects exceeded retention. Delete manually.")
+        logger.warning("=" * 65)
 
-    logger.info("Phase 3 complete | rules_added=%d | overdue_cohorts=%d", rules_added, len(overdue))
+    logger.info(
+        "Phase 3 complete | rules_added=%d | overdue=%d",
+        rules_added, len(overdue)
+    )
     return rules_added, overdue
 
 
 # =============================================================================
-# ENTRYPOINT — run all three phases in sequence
+# ENTRYPOINT
 # =============================================================================
 
 def main():
-    logger.info("=" * 60)
-    logger.info("OCI MIGRATION SCRIPT — S3 → OCI Object Storage")
-    logger.info("Source bucket : %s", S3_SOURCE_BUCKET)
-    logger.info("DRY RUN       : %s", DRY_RUN)
-    logger.info("SKIP EXISTING : %s", SKIP_EXISTING)
-    logger.info("=" * 60)
+    logger.info("=" * 65)
+    logger.info("OCI MIGRATION — S3 → OCI Object Storage")
+    logger.info("Source : %s | DRY_RUN=%s | SKIP_EXISTING=%s",
+                S3_SOURCE_BUCKET, DRY_RUN, SKIP_EXISTING)
+    logger.info("Config : %s", os.path.normpath(_CONFIG_PATH))
+    logger.info("=" * 65)
 
-    # Phase 1 — always run first to build the inventory
+    # Load single config — shared with Terraform and upload router
+    classifications = _load_config()
+    routing_map     = _build_routing_map(classifications)
+    retention_map   = _build_retention_map(classifications)
+
+    logger.info("Loaded %d classifications from config", len(classifications))
+
+    # Phase 1
     total = phase1_extract_inventory()
     if total == 0:
-        logger.error("No objects found. Exiting.")
+        logger.error("No objects found in source bucket. Exiting.")
         return
 
-    # Phase 2 — copy objects S3 → OCI
-    copied, errors = phase2_copy_objects()
+    # Phase 2
+    copied, errors = phase2_copy_objects(routing_map)
     if errors > 0:
-        logger.warning("%d errors in Phase 2 — review migration.log before Phase 3", errors)
+        logger.warning(
+            "%d errors in Phase 2 — review %s before Phase 3", errors, LOG_FILE
+        )
 
-    # Phase 3 — apply cohort-specific lifecycle rules
-    _, client_ns = _get_oci_client()
-    phase3_apply_cohort_lifecycle_rules(oci_namespace=client_ns)
+    # Phase 3
+    _, namespace = _get_oci_client()
+    phase3_apply_cohort_lifecycle_rules(routing_map, retention_map, namespace)
 
-    logger.info("=" * 60)
+    logger.info("=" * 65)
     logger.info("Migration complete.")
-    logger.info("Monitor OCI lifecycle rules for the first 30 days post-migration.")
-    logger.info("After validation, this script can be safely deleted.")
-    logger.info("=" * 60)
+    logger.info("Monitor OCI lifecycle rules for the first 30 days.")
+    logger.info("Delete this script after cutover validation is confirmed.")
+    logger.info("=" * 65)
 
 
 if __name__ == "__main__":

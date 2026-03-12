@@ -1,17 +1,16 @@
 # =============================================================================
-# terraform.tfvars  (TEMPLATE — fill in your OCI values before running)
+# terraform.tfvars  (TEMPLATE — fill in before running, never commit)
 # =============================================================================
 #
 # WHAT THIS FILE DOES:
-#   Supplies the environment-specific OCI values needed by main.tf.
-#   Copy this file, fill in your actual OCID values, and never
-#   commit the filled-in version to source control.
-#   Use a secrets manager or CI/CD environment variables in pipelines.
+#   Supplies the three OCI environment values needed by main.tf.
+#   Copy this file to terraform.tfvars, fill in your actual values.
+#   terraform.tfvars is in .gitignore — never commit it.
 #
 # HOW TO GET THESE VALUES:
 #   compartment_id : OCI Console → Identity → Compartments → copy OCID
-#   namespace      : oci os ns get  (via OCI CLI)
-#   region         : OCI Console → top-right region selector
+#   namespace      : run:  oci os ns get
+#   region         : OCI Console → top-right region dropdown
 # =============================================================================
 
 compartment_id = "ocid1.compartment.oc1..your-compartment-ocid-here"

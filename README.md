@@ -1,7 +1,26 @@
 # OCI Object Storage Migration — S3 Lifecycle Solution
 
-AWS S3 → OCI Object Storage migration with native OCI lifecycle management.  
+AWS S3 → OCI Object Storage migration with native OCI lifecycle management.
 Zero custom lifecycle code. Oracle enforces all archive and delete rules.
+
+---
+
+## The One-File Rule
+
+**There is exactly one file that ever changes:**
+
+```
+config/classifications.json
+```
+
+Both Terraform (infrastructure) and the Python upload router (application)
+read directly from this file. They cannot get out of sync because there is
+only one place where bucket names, prefixes, and retention rules live.
+
+**To add a new data classification:**
+1. Add one JSON block to `config/classifications.json`
+2. Run `terraform apply`
+3. Done — the router picks it up on next start automatically
 
 ---
 
@@ -9,113 +28,95 @@ Zero custom lifecycle code. Oracle enforces all archive and delete rules.
 
 ```
 oci-migration/
+│
+├── config/
+│   └── classifications.json        ← THE ONLY FILE THAT EVER CHANGES
+│                                     Read by: Terraform + Python router
+│
 ├── terraform/
-│   ├── main.tf                          # Core Terraform — never changes
-│   ├── variables.tf                     # Input variable declarations
-│   ├── lifecycle_config.auto.tfvars     # ← EDIT THIS to add classifications
-│   └── terraform.tfvars.template        # Fill in your OCI values
+│   ├── main.tf                     ← reads classifications.json, never changes
+│   ├── variables.tf                ← OCI env variables only
+│   └── terraform.tfvars.template   ← copy → terraform.tfvars, fill in values
 │
 ├── router/
-│   ├── router_config.py                 # ← EDIT THIS to match tfvars
-│   └── oci_upload_router.py             # Production upload router class
+│   └── oci_upload_router.py        ← reads classifications.json at startup
 │
 ├── migration/
-│   └── migration_script.py              # One-time S3 → OCI migration
+│   └── migration_script.py         ← one-time cutover, reads classifications.json
 │
 └── README.md
 ```
 
 ---
 
-## The Two-File Rule
-
-When adding a new data classification, edit **exactly two files**:
-
-| File | Change |
-|---|---|
-| `terraform/lifecycle_config.auto.tfvars` | Add one line under the correct bucket's `prefixes` block |
-| `router/router_config.py` | Add one matching line to `ROUTING_MAP` |
-
-Then run `terraform apply`. No code changes. No developer needed.
-
----
-
 ## Quick Start
 
-### 1. Infrastructure Setup (Week 1–2)
+### 1. Fill in OCI values
 
 ```bash
 cd terraform
-
-# Copy and fill in your OCI values
 cp terraform.tfvars.template terraform.tfvars
-# Edit terraform.tfvars with your compartment_id, namespace, region
-
-# Deploy all buckets and lifecycle policies
-terraform init
-terraform plan    # review what will be created
-terraform apply   # creates 4 buckets + all lifecycle rules
+# Edit terraform.tfvars — add compartment_id, namespace, region
 ```
 
-### 2. Application Integration (Week 2–3)
+### 2. Deploy infrastructure
+
+```bash
+terraform init
+terraform plan    # review — should show 4 buckets + lifecycle rules
+terraform apply
+```
+
+### 3. Use the router in your application
 
 ```python
 from router.oci_upload_router import OCIUploadRouter
 
 router = OCIUploadRouter()
 
-# Upload a PII customer file
 router.upload(
-    object_name    = "customer-12345-profile.json",
+    object_name    = "customer-9821-profile.json",
     body           = file_bytes,
     classification = "pii-customers",
 )
-# → lands in: bucket-pii-prod/customers/customer-12345-profile.json
-# → OCI archives after 90 days automatically
-# → OCI deletes after 7 years automatically
+# → lands in: bucket-pii-prod/customers/customer-9821-profile.json
+# → OCI archives after 90 days, deletes after 7 years — automatically
 ```
 
-### 3. Migration Cutover (Week 3–4)
+### 4. Run migration (once, during cutover)
 
 ```bash
 cd migration
-
-# Edit configuration at the top of migration_script.py
-# Set: S3_SOURCE_BUCKET, S3_REGION, DRY_RUN = True first
-
-# Dry run — review output before actual migration
+# Edit S3_SOURCE_BUCKET and S3_REGION at top of migration_script.py
+# Run dry run first:
+#   set DRY_RUN = True, then:
 python migration_script.py
-
-# Real run
-# Set DRY_RUN = False, then:
-python migration_script.py
+# Review migration.log, then set DRY_RUN = False and run again
 ```
 
 ---
 
 ## Bucket Architecture
 
-| Bucket | Classification | Archive After | Delete After |
+| Bucket | Classification Keys | Archive | Delete |
 |---|---|---|---|
-| `bucket-pii-prod` | PII data | 30–90 days | 7–15 years |
-| `bucket-compliance-prod` | Regulatory / Legal | 7–30 days | 7–10 years |
-| `bucket-temp-processing` | Temp / pipeline | Never | 1–7 days |
-| `bucket-logs-prod` | Logs | 7–30 days | 30–365 days |
+| `bucket-pii-prod` | pii-customers, pii-employees, pii-financial, pii-health | 30–90 days | 7–15 years |
+| `bucket-compliance-prod` | compliance-sox, compliance-gdpr, compliance-contracts, compliance-audit | 7–30 days | 7–10 years |
+| `bucket-temp-processing` | temp-raw, temp-processing, temp-staging | None | 1–7 days |
+| `bucket-logs-prod` | log-application, log-access, log-security | 7–30 days | 30–365 days |
 
 ---
 
 ## What Oracle Manages vs Your Team
 
-**Oracle manages (zero effort after setup):**
-- Daily lifecycle evaluation on every object
-- Standard → Archive tier transitions
-- Permanent deletion on schedule
-- Retry logic, scaling, SLA coverage
-
-**Your team owns (minimal):**
-- `lifecycle_config.auto.tfvars` — edit when classifications change
-- `router_config.py` — keep in sync with tfvars
-- `oci_upload_router.py` — stable after initial build, ~80 lines
+| Oracle Manages (zero effort) | Your Team Owns |
+|---|---|
+| Daily lifecycle evaluation | `classifications.json` — edit when rules change |
+| Archive tier transitions | `terraform apply` — after each config change |
+| Permanent deletion on schedule | `oci_upload_router.py` — stable after initial build |
+| Retry logic and scaling | One-time migration script during cutover |
+| Full audit trail | — |
+| SLA coverage | — |
 
 ---
 
@@ -127,15 +128,14 @@ pip install oci boto3
 
 # Terraform
 terraform >= 1.3.0
-OCI provider >= 5.0.0
+OCI Terraform provider >= 5.0.0
 ```
 
 ---
 
-## Important Notes
+## Security Notes
 
-- `terraform.tfvars` contains sensitive OCID values — **do not commit to source control**
-- `migration_script.py` is a one-time use script — delete after cutover validation
-- The migration script is resumable — re-running skips objects already in OCI
-- Always run with `DRY_RUN = True` first and review `migration.log` before the real run
-- Monitor OCI lifecycle rules for the first 30 days after migration cutover
+- `terraform.tfvars` contains OCID values — **never commit, already in .gitignore**
+- `migration_script.py` is a one-time script — **delete after cutover validation**
+- Migration script is resumable — re-running with `SKIP_EXISTING = True` skips
+  objects already copied to OCI
