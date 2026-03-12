@@ -52,8 +52,8 @@ import oci.object_storage
 S3_SOURCE_BUCKET = "your-source-s3-bucket"   # AWS S3 bucket to migrate from
 S3_REGION        = "us-east-1"               # AWS region of source bucket
 OCI_CONFIG_PATH  = "~/.oci/config"           # OCI SDK config file path
-INVENTORY_FILE   = "s3_inventory.csv"        # CSV written by Phase 1
-LOG_FILE         = "migration.log"           # Full run log
+INVENTORY_FILE   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "s3_inventory.csv")
+LOG_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migration.log")
 
 SKIP_EXISTING    = True    # Skip objects already in OCI — safe for re-runs
 DRY_RUN          = True    # ALWAYS start True — set False only after reviewing migration.log
@@ -322,6 +322,7 @@ def phase2_copy_objects(routing_map: dict) -> tuple[int, int]:
 def phase3_apply_cohort_lifecycle_rules(
     routing_map   : dict,
     retention_map : dict,
+    client,
     oci_namespace : str,
 ) -> tuple[int, list]:
     """
@@ -489,8 +490,8 @@ def main():
         )
 
     # Phase 3
-    _, namespace = _get_oci_client()
-    phase3_apply_cohort_lifecycle_rules(routing_map, retention_map, namespace)
+    client, namespace = _get_oci_client()
+    phase3_apply_cohort_lifecycle_rules(routing_map, retention_map, client, namespace)
 
     logger.info("=" * 65)
     logger.info("Migration complete.")
