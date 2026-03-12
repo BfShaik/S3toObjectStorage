@@ -1,0 +1,23 @@
+# Terraform — never commit these
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/tfplan
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Migration artifacts — local only
+migration/s3_inventory.csv
+migration/migration.log
+
+# OCI credentials — never commit
+*.pem
+*.key
+.oci/config
