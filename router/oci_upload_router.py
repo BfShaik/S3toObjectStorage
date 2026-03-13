@@ -31,6 +31,7 @@
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -46,6 +47,11 @@ _CONFIG_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "..", "config", "classifications.json"
 )
+
+# Files at or above this size use OCI server-side copy_object (async, no bandwidth cost).
+# Files below this size use client-side download → upload (simple, synchronous).
+# Override per-call via reclassify(large_file_threshold=...) if needed.
+_LARGE_FILE_THRESHOLD_BYTES = 500 * 1024 * 1024   # 500 MB
 
 
 def _load_routing_map() -> dict[str, tuple[str, str]]:
@@ -117,6 +123,7 @@ class OCIUploadRouter:
             profile     : OCI config profile name.    Default: DEFAULT
         """
         oci_cfg             = oci.config.from_file(config_path, profile)
+        self._oci_region    = oci_cfg["region"]            # stored for server-side copy_object
         self._client        = oci.object_storage.ObjectStorageClient(oci_cfg)
         self._namespace     = self._client.get_namespace().data
         self._routing_map   = _load_routing_map()
@@ -349,19 +356,29 @@ class OCIUploadRouter:
     # -------------------------------------------------------------------------
     def reclassify(
         self,
-        object_key         : str,
-        current_bucket     : str,
-        new_classification : str,
-        extra_meta         : Optional[dict] = None,
+        object_key             : str,
+        current_bucket         : str,
+        new_classification     : str,
+        extra_meta             : Optional[dict] = None,
+        large_file_threshold   : int = _LARGE_FILE_THRESHOLD_BYTES,
     ) -> dict:
         """
         Move an object to a new classification's bucket and prefix.
 
-        Downloads the object from its current location, re-uploads to the
-        bucket/prefix defined for new_classification (preserving all
-        existing metadata and the original creation date), then deletes
-        the original. The original is only deleted after a successful
-        upload — no data loss on partial failure.
+        Automatically selects the copy strategy based on file size:
+
+          < large_file_threshold  → client-side  (download → upload → delete)
+                                    Simple and synchronous. Data passes through
+                                    this machine. Best for small-medium files.
+
+          ≥ large_file_threshold  → server-side  (copy_object → poll → delete)
+                                    OCI copies within its own network — no
+                                    bandwidth cost to you. Async, so we poll
+                                    until the copy lands before deleting source.
+                                    Best for large files (video, DB dumps, etc.)
+
+        In both cases the original is only deleted after the copy is confirmed
+        complete — no data loss on partial failure.
 
         Use this when the object's data class has genuinely changed
         (e.g. temp-raw promoted to compliance-sox after legal review),
@@ -369,16 +386,19 @@ class OCIUploadRouter:
         the ~1000 rule bucket policy limit that update_lifecycle has).
 
         Args:
-            object_key         : Full current key including prefix
-            current_bucket     : Current OCI bucket name
-            new_classification : Target classification from classifications.json
-            extra_meta         : Extra metadata to attach on re-upload (optional)
+            object_key           : Full current key including prefix
+            current_bucket       : Current OCI bucket name
+            new_classification   : Target classification from classifications.json
+            extra_meta           : Extra metadata to attach on re-upload (optional)
+            large_file_threshold : Byte threshold for switching to server-side copy.
+                                   Default: 500 MB (_LARGE_FILE_THRESHOLD_BYTES)
 
         Returns:
             Same shape as upload(): { bucket, key, namespace, classification }
 
         Raises:
             ValueError                  : Unknown new_classification
+            TimeoutError                : Server-side copy did not complete in time
             oci.exceptions.ServiceError : OCI API error
 
         Example:
@@ -389,6 +409,8 @@ class OCIUploadRouter:
                 current_bucket     = result["bucket"],
                 new_classification = "compliance-sox",
             )
+            # Small file  → client-side copy automatically
+            # Large file  → server-side copy automatically (no bandwidth cost)
             # Object now lives in bucket-compliance-prod/sox/contract.pdf
             # with 7-year delete policy applied automatically
         """
@@ -398,48 +420,47 @@ class OCIUploadRouter:
                 f"Valid values: {sorted(self._valid_keys)}"
             )
 
-        # ── Step 1: Download object + read existing metadata ─────────────────
+        # ── Step 1: HEAD — get file size + existing metadata (no download yet) ─
         try:
-            response = self._client.get_object(self._namespace, current_bucket, object_key)
-            body     = response.data.content
-            head     = self._client.head_object(self._namespace, current_bucket, object_key)
-            old_meta = {
+            head           = self._client.head_object(self._namespace, current_bucket, object_key)
+            content_length = int(head.headers.get("content-length", 0))
+            old_meta       = {
                 k.replace("opc-meta-", ""): v
                 for k, v in head.headers.items()
                 if k.lower().startswith("opc-meta-")
             }
         except oci.exceptions.ServiceError as e:
             logger.error(
-                "Failed to read source object %s/%s: http=%s | %s",
+                "Failed to HEAD source object %s/%s: http=%s | %s",
                 current_bucket, object_key, e.status, e.message
             )
             raise
 
-        # ── Step 2: Build relative key — strip old classification prefix ──────
+        # ── Step 2: Build destination key — strip old classification prefix ────
         old_classification = old_meta.get("classification", "")
         if old_classification in self._routing_map:
             _, old_prefix = self._routing_map[old_classification]
-            # Strip old prefix to get the relative sub-path
-            relative_key = (
+            relative_key  = (
                 object_key[len(old_prefix):]
                 if object_key.startswith(old_prefix)
                 else object_key.split("/")[-1]
             )
         else:
-            # Unknown old classification — use leaf filename only
             relative_key = object_key.split("/")[-1]
+
+        new_bucket, new_prefix = self._routing_map[new_classification]
+        new_key                = f"{new_prefix}{relative_key}"
 
         # ── Step 3: Merge metadata — preserve creation date, update class ─────
         merged_meta = {**old_meta}
-        merged_meta["classification"]       = new_classification
-        merged_meta["reclassified-from"]    = old_classification or "unknown"
+        merged_meta["classification"]        = new_classification
+        merged_meta["reclassified-from"]     = old_classification or "unknown"
         merged_meta["reclassification-date"] = (
             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         )
         if extra_meta:
             merged_meta.update(extra_meta)
 
-        # Recover original creation date for upload() so it is preserved
         original_date = None
         raw_date = old_meta.get("original-creation-date")
         if raw_date:
@@ -448,34 +469,127 @@ class OCIUploadRouter:
             except ValueError:
                 pass
 
-        # ── Step 4: Upload to new classification ──────────────────────────────
-        result = self.upload(
-            object_name    = relative_key,
-            body           = body,
-            classification = new_classification,
-            extra_meta     = merged_meta,
-            original_date  = original_date,
+        # ── Step 4: Copy — strategy chosen automatically by file size ──────────
+        strategy = "server-side" if content_length >= large_file_threshold else "client-side"
+        logger.info(
+            "Reclassifying | %s/%s → %s/%s | %.1f MB | strategy=%s",
+            current_bucket, object_key, new_bucket, new_key,
+            content_length / (1024 * 1024), strategy,
         )
 
-        # ── Step 5: Delete original — only after successful upload ────────────
+        if strategy == "client-side":
+            # Download → upload. Simple and synchronous.
+            try:
+                response = self._client.get_object(self._namespace, current_bucket, object_key)
+                body     = response.data.content
+            except oci.exceptions.ServiceError as e:
+                logger.error(
+                    "Client-side: download failed %s/%s: http=%s | %s",
+                    current_bucket, object_key, e.status, e.message
+                )
+                raise
+
+            result = self.upload(
+                object_name    = relative_key,
+                body           = body,
+                classification = new_classification,
+                extra_meta     = merged_meta,
+                original_date  = original_date,
+            )
+
+        else:
+            # Server-side copy — OCI copies within its network, no bandwidth cost.
+            # copy_object is asynchronous: we must poll before deleting the source.
+            try:
+                self._client.copy_object(
+                    namespace_name      = self._namespace,
+                    bucket_name         = current_bucket,
+                    copy_object_details = oci.object_storage.models.CopyObjectDetails(
+                        source_object_name          = object_key,
+                        destination_region          = self._oci_region,
+                        destination_namespace       = self._namespace,
+                        destination_bucket          = new_bucket,
+                        destination_object_name     = new_key,
+                        destination_object_metadata = merged_meta,
+                    ),
+                )
+            except oci.exceptions.ServiceError as e:
+                logger.error(
+                    "Server-side: copy_object failed %s/%s: http=%s | %s",
+                    current_bucket, object_key, e.status, e.message
+                )
+                raise
+
+            # Block until the destination object actually exists
+            self._wait_for_copy(new_bucket, new_key)
+
+            result = {
+                "bucket"        : new_bucket,
+                "key"           : new_key,
+                "namespace"     : self._namespace,
+                "classification": new_classification,
+            }
+
+        # ── Step 5: Delete original — only after copy is confirmed complete ────
         try:
             self._client.delete_object(self._namespace, current_bucket, object_key)
         except oci.exceptions.ServiceError as e:
             logger.error(
-                "Upload succeeded but delete of original failed %s/%s: http=%s | %s — "
+                "Copy succeeded but delete of original failed %s/%s: http=%s | %s — "
                 "object exists in both locations, manual cleanup needed.",
                 current_bucket, object_key, e.status, e.message
             )
             raise
 
-        new_bucket, _ = self._routing_map[new_classification]
         logger.info(
-            "Reclassified | %s/%s → %s/%s | %s → %s",
-            current_bucket, object_key,
-            new_bucket, result["key"],
-            old_classification or "?", new_classification,
+            "Reclassified | %s/%s → %s/%s | %s → %s | strategy=%s",
+            current_bucket, object_key, new_bucket, new_key,
+            old_classification or "?", new_classification, strategy,
         )
         return result
+
+    # -------------------------------------------------------------------------
+    # _wait_for_copy — poll until server-side copy lands in destination bucket
+    # -------------------------------------------------------------------------
+    def _wait_for_copy(
+        self,
+        bucket     : str,
+        object_key : str,
+        timeout_s  : int = 300,
+        interval_s : int = 5,
+    ) -> None:
+        """
+        Poll with head_object until the object appears in the destination bucket.
+
+        OCI copy_object is asynchronous — it returns immediately but the data
+        may not be readable yet. We must confirm the copy is complete before
+        deleting the source, otherwise we risk data loss.
+
+        Args:
+            bucket     : Destination bucket name
+            object_key : Destination object key
+            timeout_s  : Max seconds to wait before giving up. Default: 300s (5 min)
+            interval_s : Seconds between polls. Default: 5s
+
+        Raises:
+            TimeoutError                : Copy did not complete within timeout_s
+            oci.exceptions.ServiceError : Unexpected OCI error during polling
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            try:
+                self._client.head_object(self._namespace, bucket, object_key)
+                return   # object exists — copy is complete
+            except oci.exceptions.ServiceError as e:
+                if e.status == 404:
+                    time.sleep(interval_s)
+                    continue
+                raise    # unexpected error — surface immediately
+
+        raise TimeoutError(
+            f"Server-side copy did not complete within {timeout_s}s: "
+            f"{bucket}/{object_key}. Source object was NOT deleted."
+        )
 
     # -------------------------------------------------------------------------
     # valid_classifications — useful for validation in calling code
