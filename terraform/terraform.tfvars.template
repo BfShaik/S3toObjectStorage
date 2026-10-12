@@ -16,3 +16,6 @@
 compartment_id = "ocid1.compartment.oc1..your-compartment-ocid-here"
 namespace      = "your-tenancy-namespace-here"
 region         = "us-ashburn-1"
+
+# Leave false until a reviewed Terraform plan is approved.
+enable_delete = false

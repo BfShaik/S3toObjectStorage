@@ -16,6 +16,7 @@ venv/
 # Migration artifacts — local only
 migration/s3_inventory.csv
 migration/migration.log
+terraform/migration_cohorts.auto.tfvars.json
 
 # OCI credentials — never commit
 *.pem
